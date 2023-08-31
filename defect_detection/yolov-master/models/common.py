@@ -3,6 +3,7 @@
 Common modules
 """
 
+import torch.fft as fft
 import logging
 import math
 import warnings
@@ -13,6 +14,7 @@ import numpy as np
 import pandas as pd
 import requests
 import torch
+
 import torch.nn as nn
 from PIL import Image
 from torch.cuda import amp
@@ -30,6 +32,101 @@ def autopad(k, p=None):  # kernel, padding
     if p is None:
         p = k // 2 if isinstance(k, int) else [x // 2 for x in k]  # auto-pad
     return p
+
+
+class FCAH(nn.Module):
+    def __init__(self):
+        super(FCAH,self).__init__()
+        self.conv=nn.Conv2d(1,1,kernel_size=1,padding=0,bias=False,dtype=torch.float32)
+
+        self.avg_pool=nn.AdaptiveAvgPool2d(1)
+        self.max_pool=nn.AdaptiveMaxPool2d(1)
+        self.sigmoid=nn.Sigmoid()
+    def forward(self,x):
+        t=fft.fft(x)
+        cutoff_frequency = 0.1  # 调整此值以控制高通滤波的频率
+        height=int(t.shape[2])
+        i = np.fft.fftfreq(height, d=1.0)
+        j = np.fft.fftfreq(height, d=1.0)
+        i, j = np.meshgrid(i, j)
+        distance = np.sqrt(i ** 2 + j ** 2)
+        filter = np.exp(-distance ** 2 / (2 * (cutoff_frequency / 2.0) ** 2))
+        filter = torch.tensor(filter, dtype=torch.float32).unsqueeze(0).unsqueeze(0)  # 增加batch和channel维度
+        filter=filter.to(t.device)
+       
+    ###将高通滤波器应用于频域数据
+        h = min(t.size(2), filter.size(2))
+        w = min(t.size(3), filter.size(3))
+
+        # 在高度和宽度维度上进行裁剪，以使两个张量的大小相等
+        t = t[:, :, :h, :w]
+        filter = filter[:, :, :h, :w]
+        filter=filter.to(t.dtype)
+
+        filtered_data = t * filter
+
+        # #傅里叶逆变换
+        filtered_data=fft.ifft(filtered_data)
+     
+        #取实部和虚部分别池化在合并
+        filtered_data1=torch.real(filtered_data)
+        filtered_data2=torch.imag(filtered_data)
+        avg_out1=self.avg_pool(filtered_data1)
+        avg_out2=self.avg_pool(filtered_data2)
+        out=avg_out1+avg_out2
+        out=out.to(self.conv.weight.dtype)
+        out=self.conv(out)
+        out=self.sigmoid(out)
+        return out
+
+
+class SSAMH(nn.Module):
+    def __init__(self):
+        super(SSAMH, self).__init__()
+ 
+        self.avg_pool=nn.AdaptiveAvgPool2d(1)
+        self.conv1 = nn.Conv2d(2, 1, 1, padding=0, bias=False,dtype=torch.float32)  # 7,3     3,1
+        self.sigmoid = nn.Sigmoid()
+
+        lap_kernel=torch.tensor([[0,1,0],
+                                [1,-4,1],
+                                [0,1,0]],dtype=torch.float32)
+        self.lap_conv=nn.Conv2d(1,1,3,padding=1,bias=False)
+        lap_kernel=lap_kernel.unsqueeze(0).unsqueeze(0).repeat(1,1,1,1)
+        self.lap_conv.weight.data=lap_kernel
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        avg_out=self.lap_conv(avg_out)
+        max_out=self.lap_conv(max_out)
+        x = torch.cat([avg_out, max_out], dim=1)
+        x = self.conv1(x)
+        return self.sigmoid(x)
+
+
+#HARF注意力模块
+class HFARH(nn.Module):
+    def __init__(self,in_chanl):
+        super(HFARH,self).__init__()
+        self.conv1=nn.Conv2d(in_chanl,1,kernel_size=1,padding=0,bias=False)
+        self.conv2=nn.Conv2d(1,in_chanl,kernel_size=3,padding=1,bias=False)
+        self.conv3=nn.Conv2d(1,in_chanl,kernel_size=1,padding=0,bias=False)
+        self.fca=FCAH()
+        self.esa=SSAMH()
+        self.relu=nn.ReLU()
+    
+    def forward(self,x):
+        x=self.conv1(x)
+        x=self.conv2(x)
+        x=self.conv1(x)
+        x=self.relu(x)
+        fc=x*self.fca(x)
+        # es=x*self.esa(x)
+        # result=es+fc
+        # result=self.conv3(result)
+        result=self.conv3(fc)
+        return result
 
 
 #scSE通道注意力模块
@@ -69,42 +166,6 @@ class scSE(nn.Module):
         U_sse = self.sSE(U)
         U_cse = self.cSE(U)
         return U_cse+U_sse
-
-#SSAM锐化空间注意力
-class SSAM(nn.Module):
-    def __init__(self, ):
-        super(SSAM, self).__init__()
- 
-    
-        self.conv1 = nn.Conv2d(2, 1, 1, padding=0, bias=False)  # 7,3     3,1
-        self.sigmoid = nn.Sigmoid()
-
-        lap_kernel=torch.tensor([[0,1,0],
-                                [1,-4,1],
-                                [0,1,0]],dtype=torch.float32)
-        self.lap_conv=nn.Conv2d(1,1,3,padding=1,stride=1,bias=False)
-        #kernel_l=lap_kernel.unsqueeze(0).unsqueeze(0)
-        self.lap_conv.weight.data=lap_kernel
-
- 
-    def forward(self, x):
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        x = torch.cat([avg_out, max_out], dim=1)
-        x = self.conv1(x)
-        return self.sigmoid(x)
-
-#CBAAM注意力机制
-class CBAAM(nn.Module):
-    def __init__(self, in_channels):
-        super(CBAAM, self).__init__()
-        self.ca = scSE(in_channels)
-        self.sa = SSAM()
-        
-    def forward(self, x):
-        out = x * self.ca(x)
-        result = out * self.sa(out)
-        return result
 
 
 
